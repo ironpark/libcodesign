@@ -107,9 +107,11 @@ python scripts/build.py linux_amd64 --test --strip --smoke
 python scripts/package.py linux_amd64   # needs THIRD_PARTY_LICENSES.html
 ```
 
-`--strip` removes debug sections (`strip --strip-debug`), which is the difference
-between a ~900 MB archive and a shippable one; the symbol table and code are
-untouched. `--smoke` links and runs `tests/smoke.c` against the stripped result.
+`--strip` removes debug sections (`strip --strip-debug`), which is the other half
+of what keeps the archive small -- fat LTO being the first half; the symbol table
+and code are untouched. `--smoke` links and runs `tests/smoke.c` against the stripped result.
+Only `zapp_rcodesign_run` and `zapp_rcodesign_free` are exported, so fat LTO drops
+everything the two of them cannot reach.
 The notices file comes from `cargo about generate about.hbs -o THIRD_PARTY_LICENSES.html`
 (`cargo install cargo-about --locked --version 0.8.4`).
 

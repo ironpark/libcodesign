@@ -18,6 +18,11 @@ serde_json = "1"
 
 [profile.release]
 debug = 0
+# Without LTO the archive carries every object of every dependency -- the AWS
+# SDK alone is 50 MB -- because nothing links it until a consumer does. Fat LTO
+# keeps only what the two exported C functions reach: 122 MB down to 25 MB.
+lto = "fat"
+codegen-units = 1
 
 [dev-dependencies]
 chrono = "0.4"
