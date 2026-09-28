@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::{
     ffi::{c_char, CStr, CString},
     panic::{catch_unwind, AssertUnwindSafe},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -21,6 +21,7 @@ struct Options {
     p12_password_file: String,
     pem_file: String,
     api_key_file: String,
+    entitlements_file: String,
 }
 
 #[derive(Deserialize)]
@@ -70,11 +71,29 @@ fn execute(request: Request, timestamp: bool) -> Result<(), Box<dyn std::error::
             let key = certs.private_key()?;
             let mut settings = SigningSettings::default();
             certs.load_into_signing_settings(&mut settings)?;
+            settings.set_team_id_from_signing_certificate();
+            settings.set_code_signature_flags(SettingsScope::Main, CodeSignatureFlags::RUNTIME);
+            if path.is_dir() {
+                // A bundle's main scope flags reach its main executable only;
+                // nested code keeps the flags it was last signed with. The
+                // notary wants the hardened runtime on every executable, so
+                // each Mach-O is given it first, untimestamped, and signing
+                // the bundle then preserves it along with any entitlements.
+                for file in macho_files(path)? {
+                    UnifiedSigner::new(settings.clone()).sign_path_in_place(&file)?;
+                }
+            }
             if timestamp {
                 settings.set_time_stamp_url("http://timestamp.apple.com/ts01")?;
             }
-            settings.set_team_id_from_signing_certificate();
-            settings.set_code_signature_flags(SettingsScope::Main, CodeSignatureFlags::RUNTIME);
+            // Main scope reaches only the main executable; nested code keeps
+            // the entitlements it already carries, as it does without a file.
+            if !opts.entitlements_file.is_empty() {
+                settings.set_entitlements_xml(
+                    SettingsScope::Main,
+                    std::fs::read_to_string(&opts.entitlements_file)?,
+                )?;
+            }
             UnifiedSigner::new(settings).sign_path_in_place(path)?;
             key.finish()?;
         }
@@ -89,6 +108,40 @@ fn execute(request: Request, timestamp: bool) -> Result<(), Box<dyn std::error::
         _ => return Err("unsupported signing operation".into()),
     }
     Ok(())
+}
+
+/// Lists the Mach-O files under dir, not following symlinks.
+fn macho_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            found.extend(macho_files(&entry.path())?);
+        } else if kind.is_file() && is_macho(&entry.path())? {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+fn is_macho(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut header = [0u8; 8];
+    match std::fs::File::open(path)?.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let magic = u32::from_be_bytes(header[..4].try_into().unwrap());
+    Ok(match magic {
+        0xfeedface | 0xfeedfacf | 0xcefaedfe | 0xcffaedfe => true,
+        // Java class files share the universal magic; there the next word is
+        // a class file version, 45 or more, where a universal binary counts
+        // its few architectures.
+        0xcafebabe | 0xcafebabf => u32::from_be_bytes(header[4..].try_into().unwrap()) < 45,
+        _ => false,
+    })
 }
 
 /// Returns NULL on success; otherwise an owned error string, released with zapp_rcodesign_free.
@@ -170,6 +223,13 @@ mod tests {
             key.to_pkcs8_one_asymmetric_key_der().to_vec(),
         ));
         std::fs::write(&cert_path, format!("{}{}", cert.encode_pem(), private)).unwrap();
+        let entitlements_path = dir.path().join("app.entitlements");
+        std::fs::write(
+            &entitlements_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>"#,
+        )
+        .unwrap();
         for (name, builder) in [
             ("amd64", MachOBuilder::new_x86_64(2)),
             ("arm64", MachOBuilder::new_aarch64(2)),
@@ -182,6 +242,7 @@ mod tests {
                     path: path.to_str().unwrap().into(),
                     options: Options {
                         pem_file: cert_path.to_str().unwrap().into(),
+                        entitlements_file: entitlements_path.to_str().unwrap().into(),
                         ..Default::default()
                     },
                 },
@@ -199,6 +260,98 @@ mod tests {
                     .unwrap()
                     .flags
                     .contains(CodeSignatureFlags::RUNTIME));
+                assert!(signature
+                    .entitlements()
+                    .unwrap()
+                    .unwrap()
+                    .as_str()
+                    .contains("com.apple.security.cs.allow-jit"));
+            }
+        }
+    }
+
+    #[test]
+    fn signs_nested_code_with_hardened_runtime() {
+        use apple_codesign::{
+            create_self_signed_code_signing_certificate, macho_builder::MachOBuilder,
+            CertificateProfile, MachFile,
+        };
+        use x509_certificate::{EcdsaCurve, KeyAlgorithm};
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("certificate.pem");
+        let (cert, key) = create_self_signed_code_signing_certificate(
+            KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1),
+            CertificateProfile::DeveloperIdApplication,
+            "TESTTEAM",
+            "Zapp Test",
+            "US",
+            chrono::Duration::hours(1),
+        )
+        .unwrap();
+        let private = pem::encode(&pem::Pem::new(
+            "PRIVATE KEY",
+            key.to_pkcs8_one_asymmetric_key_der().to_vec(),
+        ));
+        std::fs::write(&cert_path, format!("{}{}", cert.encode_pem(), private)).unwrap();
+        let entitlements_path = dir.path().join("app.entitlements");
+        std::fs::write(
+            &entitlements_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>"#,
+        )
+        .unwrap();
+
+        let app = dir.path().join("Demo.app");
+        let plist = |exe: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>{exe}</string><key>CFBundleIdentifier</key><string>com.example.{exe}</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>"#
+            )
+        };
+        let binaries = [
+            "Contents/MacOS/Demo",
+            "Contents/MacOS/tool",
+            "Contents/Frameworks/libx.dylib",
+            "Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+            "Contents/Frameworks/Helper.app/Contents/Frameworks/liby.dylib",
+        ];
+        for rel in binaries {
+            let path = app.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, MachOBuilder::new_aarch64(2).write_macho().unwrap()).unwrap();
+        }
+        std::fs::write(app.join("Contents/Info.plist"), plist("Demo")).unwrap();
+        std::fs::write(
+            app.join("Contents/Frameworks/Helper.app/Contents/Info.plist"),
+            plist("Helper"),
+        )
+        .unwrap();
+
+        execute(
+            Request {
+                operation: "sign".into(),
+                path: app.to_str().unwrap().into(),
+                options: Options {
+                    pem_file: cert_path.to_str().unwrap().into(),
+                    entitlements_file: entitlements_path.to_str().unwrap().into(),
+                    ..Default::default()
+                },
+            },
+            false,
+        )
+        .unwrap();
+        for rel in binaries {
+            let data = std::fs::read(app.join(rel)).unwrap();
+            for binary in MachFile::parse(&data).unwrap().iter_macho() {
+                let signature = binary.code_signature().unwrap().unwrap();
+                let flags = signature.code_directory().unwrap().unwrap().flags;
+                assert!(
+                    flags.contains(CodeSignatureFlags::RUNTIME),
+                    "{rel}: {flags:?}"
+                );
+                // The entitlements file is the main executable's alone.
+                let entitled = signature.entitlements().unwrap().is_some();
+                assert_eq!(entitled, rel == "Contents/MacOS/Demo", "{rel}");
             }
         }
     }
