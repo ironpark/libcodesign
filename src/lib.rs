@@ -22,6 +22,7 @@ struct Options {
     pem_file: String,
     api_key_file: String,
     entitlements_file: String,
+    notarize_timeout_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +102,13 @@ fn execute(request: Request, timestamp: bool) -> Result<(), Box<dyn std::error::
             if opts.api_key_file.is_empty() {
                 return Err("an App Store Connect API key file is required".into());
             }
+            // Zero keeps the ten minutes callers before the option had.
+            let timeout = match opts.notarize_timeout_secs {
+                0 => 600,
+                secs => secs,
+            };
             Notarizer::from_api_key(Path::new(&opts.api_key_file))?
-                .notarize_path(path, Some(Duration::from_secs(600)))?;
+                .notarize_path(path, Some(Duration::from_secs(timeout)))?;
         }
         "staple" => Stapler::new()?.staple_path(path)?,
         _ => return Err("unsupported signing operation".into()),
@@ -193,6 +199,10 @@ mod tests {
         assert!(!error("not json").is_empty());
         assert!(error(r#"{"operation":"unknown","path":"x","options":{}}"#).contains("unsupported"));
         assert!(error(r#"{"operation":"sign","path":"x","options":{}}"#).contains("certificate"));
+        assert!(error(
+            r#"{"operation":"submit","path":"x","options":{"notarize_timeout_secs":3600}}"#
+        )
+        .contains("API key"));
         unsafe {
             let result = zapp_rcodesign_run(std::ptr::null());
             assert!(!result.is_null());

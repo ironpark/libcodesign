@@ -58,7 +58,8 @@ an error string rather than unwinding into the caller.
   "path": "/path/to/Target.app",
   "options": {
     "p12_file": "", "p12_password": "", "p12_password_file": "",
-    "pem_file": "", "api_key_file": "", "entitlements_file": ""
+    "pem_file": "", "api_key_file": "", "entitlements_file": "",
+    "notarize_timeout_secs": 0
   }
 }
 ```
@@ -66,7 +67,7 @@ an error string rather than unwinding into the caller.
 | `operation` | Required option | Effect |
 | --- | --- | --- |
 | `sign` | `p12_file` or `pem_file` | Signs in place with the hardened runtime, on every Mach-O in a bundle, and an Apple timestamp. `entitlements_file` replaces the main executable's entitlements; without it every binary keeps its own |
-| `submit` | `api_key_file` | Submits to notarization and waits up to 10 minutes |
+| `submit` | `api_key_file` | Submits to notarization and waits for the verdict up to `notarize_timeout_secs`, or 10 minutes when it is 0 |
 | `staple` | — | Staples the notarization ticket |
 
 ## Linking
