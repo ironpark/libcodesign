@@ -147,11 +147,14 @@ fn execute(request: Request, timestamp: bool) -> Result<(), Box<dyn std::error::
             };
             let mut problems = Vec::new();
             for file in &files {
+                // Bundle paths are written with /, whatever the host's separator.
                 let name = file
                     .strip_prefix(path)
                     .unwrap_or(file)
-                    .display()
-                    .to_string();
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 for problem in verify_macho_data(std::fs::read(file)?) {
                     problems.push(if name.is_empty() {
                         problem.to_string()
