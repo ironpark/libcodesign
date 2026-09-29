@@ -1,9 +1,10 @@
 //! C ABI for the apple-codesign library. No CLI parsing, global logger or subprocesses.
 use apple_codesign::{
     cli::certificate_source::{CertificateSource, P12SigningKey, PemSigningKey},
-    notarization::Notarizer,
+    notarization::{NotarizationUpload, Notarizer},
     stapling::Stapler,
-    CodeSignatureFlags, SettingsScope, SigningSettings, UnifiedSigner,
+    verify_macho_data, AppleCodesignError, CodeSignatureFlags, SettingsScope, SigningSettings,
+    UnifiedSigner,
 };
 use serde::Deserialize;
 use std::{
@@ -107,10 +108,65 @@ fn execute(request: Request, timestamp: bool) -> Result<(), Box<dyn std::error::
                 0 => 600,
                 secs => secs,
             };
-            Notarizer::from_api_key(Path::new(&opts.api_key_file))?
-                .notarize_path(path, Some(Duration::from_secs(timeout)))?;
+            let notarizer = Notarizer::from_api_key(Path::new(&opts.api_key_file))?;
+            let id = match notarizer.notarize_path(path, None)? {
+                NotarizationUpload::UploadId(id) => id,
+                NotarizationUpload::NotaryResponse(_) => return Ok(()),
+            };
+            let status = match notarizer.wait_on_notarization(&id, Duration::from_secs(timeout)) {
+                Err(AppleCodesignError::NotarizeWaitLimitReached) => {
+                    return Err(format!(
+                        "notarization had no verdict after {timeout}s; submission {id} is still being processed"
+                    )
+                    .into())
+                }
+                status => status?,
+            };
+            let verdict = status.data.attributes.status;
+            if status.into_result().is_err() {
+                // The log says why, file by file; without it the caller has
+                // only the verdict.
+                let log = notarizer
+                    .fetch_notarization_log(&id)
+                    .map(|log| log.to_string())
+                    .unwrap_or_else(|e| format!("{{\"error\":{:?}}}", e.to_string()));
+                return Err(format!(
+                    "notarization submission {id} ended {verdict:?}; notary log: {log}"
+                )
+                .into());
+            }
         }
         "staple" => Stapler::new()?.staple_path(path)?,
+        "verify" => {
+            // Every Mach-O's code digests and CMS signature; a bundle's
+            // sealed resources are not checked.
+            let files = if path.is_dir() {
+                macho_files(path)?
+            } else {
+                vec![path.to_path_buf()]
+            };
+            let mut problems = Vec::new();
+            for file in &files {
+                let name = file
+                    .strip_prefix(path)
+                    .unwrap_or(file)
+                    .display()
+                    .to_string();
+                for problem in verify_macho_data(std::fs::read(file)?) {
+                    problems.push(if name.is_empty() {
+                        problem.to_string()
+                    } else {
+                        format!("{name}: {problem}")
+                    });
+                }
+            }
+            if files.is_empty() {
+                return Err("no Mach-O binary to verify".into());
+            }
+            if !problems.is_empty() {
+                return Err(problems.join("\n").into());
+            }
+        }
         _ => return Err("unsupported signing operation".into()),
     }
     Ok(())
@@ -364,6 +420,38 @@ mod tests {
                 assert_eq!(entitled, rel == "Contents/MacOS/Demo", "{rel}");
             }
         }
+
+        // The signed bundle verifies; a binary changed after signing, or one
+        // never signed, does not.
+        let verify = |path: &Path| {
+            execute(
+                Request {
+                    operation: "verify".into(),
+                    path: path.to_str().unwrap().into(),
+                    options: Options::default(),
+                },
+                false,
+            )
+        };
+        verify(&app).unwrap();
+        let tool = app.join("Contents/MacOS/tool");
+        let mut data = std::fs::read(&tool).unwrap();
+        data[100] ^= 0xff;
+        std::fs::write(&tool, data).unwrap();
+        let unsigned = app.join("Contents/Frameworks/libz.dylib");
+        std::fs::write(
+            &unsigned,
+            MachOBuilder::new_aarch64(2).write_macho().unwrap(),
+        )
+        .unwrap();
+        let problems = verify(&app).unwrap_err().to_string();
+        assert!(problems.contains("Contents/MacOS/tool:"), "{problems}");
+        assert!(
+            problems.contains("Contents/Frameworks/libz.dylib:"),
+            "{problems}"
+        );
+        assert!(!problems.contains("Contents/MacOS/Demo:"), "{problems}");
+        assert!(verify(&app.join("Contents/Info.plist")).is_err());
     }
 
     #[test]

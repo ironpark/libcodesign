@@ -69,6 +69,12 @@ an error string rather than unwinding into the caller.
 | `sign` | `p12_file` or `pem_file` | Signs in place with the hardened runtime, on every Mach-O in a bundle, and an Apple timestamp. `entitlements_file` replaces the main executable's entitlements; without it every binary keeps its own |
 | `submit` | `api_key_file` | Submits to notarization and waits for the verdict up to `notarize_timeout_secs`, or 10 minutes when it is 0 |
 | `staple` | — | Staples the notarization ticket |
+| `verify` | — | Checks the code digests and CMS signature of a Mach-O, or of every Mach-O in a bundle; one problem per line, prefixed with the binary's path in the bundle. A bundle's sealed resources are not checked |
+
+A rejected submission's error ends with the notary's log, as the JSON Apple
+serves it: `notarization submission <id> ended Invalid; notary log: {...}`.
+Its `issues` name each file at fault. A submission still in progress when the
+wait ends is reported with its ID, so its verdict can be looked up later.
 
 ## Linking
 
