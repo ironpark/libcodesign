@@ -2,7 +2,8 @@
 """Build libzapp_rcodesign.a for one Windows/Linux target into dist/<target>/.
 
 The archive keeps its debug sections unless --strip is given; a release build
-strips them, which is what makes the artifact small enough to ship.
+strips them, which is what makes the artifact small enough to ship, and the
+LLVM bitcode Rust embeds, which Go refuses to link.
 """
 import argparse
 import os
@@ -16,6 +17,12 @@ ROOT = Path(__file__).resolve().parent.parent
 LIB = "libzapp_rcodesign.a"
 # First bytes of a short import member: Sig1 = 0, Sig2 = 0xFFFF.
 IMPORT_MAGIC = b"\x00\x00\xff\xff"
+# Sections of LLVM bitcode that rustc embeds in objects for LTO, which the
+# standard library's precompiled objects carry even after a fat LTO build. Go
+# 1.27.4 and later refuse to link an archive named in #cgo LDFLAGS that has
+# them, so a release archive must not.
+BITCODE_SECTIONS = [".llvmbc", ".llvmcmd"]
+STRIP_FLAGS = ["--strip-debug", *(f"--remove-section={s}" for s in BITCODE_SECTIONS)]
 TARGETS = {
     "linux_amd64": "x86_64-unknown-linux-gnu",
     "linux_arm64": "aarch64-unknown-linux-gnu",
@@ -42,7 +49,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=TARGETS)
     parser.add_argument("--test", action="store_true", help="run the Rust tests on the target host")
-    parser.add_argument("--strip", action="store_true", help="drop debug sections from the archive")
+    parser.add_argument("--strip", action="store_true", help="drop debug sections and embedded bitcode from the archive")
     parser.add_argument("--smoke", action="store_true", help="link and run tests/smoke.c against the archive")
     args = parser.parse_args()
     os.chdir(ROOT)
@@ -70,17 +77,19 @@ def main():
     shutil.copy2(ROOT / "target" / target / "release" / LIB, archive)
     if args.strip:
         strip_debug(goos, archive, env)
+        check_no_bitcode(archive)
     if args.smoke:
         smoke(goos, cc, archive, outdir, env)
     print(f"{archive} ({archive.stat().st_size / 1e6:.0f} MB)")
 
 
 def strip_debug(goos, archive, env):
-    """Drop the .debug_* sections, which are most of the archive's size. The
-    symbol table the linker resolves against, and the code itself, are kept."""
+    """Drop the .debug_* sections, which are most of the archive's size, and
+    the embedded bitcode, which Go refuses. The symbol table the linker
+    resolves against, and the code itself, are kept."""
     strip = env.get("STRIP") or ("llvm-strip" if goos == "windows" else "strip")
     if goos != "windows":
-        run([strip, "--strip-debug", str(archive)], env=env)
+        run([strip, *STRIP_FLAGS, str(archive)], env=env)
         return
     # llvm-strip refuses a Windows archive as a whole: raw-dylib linkage puts a
     # few short import members in it, which it reports as an unsupported object
@@ -91,13 +100,29 @@ def strip_debug(goos, archive, env):
         members = extract(archive, Path(tmp))
         objects = [m for m in members if m.read_bytes()[:4] != IMPORT_MAGIC]
         for batch in chunks(objects):
-            run([strip, "--strip-debug", *batch], env=env)
+            run([strip, *STRIP_FLAGS, *batch], env=env)
         # Over a thousand members go back in: append them in batches rather than
         # in one command line Windows would reject, then write the index once.
         archive.unlink()
         for index, batch in enumerate(chunks(members)):
             run([ar, "qcD" if index == 0 else "qD", str(archive), *batch], env=env)
         run([ar, "sD", str(archive)], env=env)
+
+
+def check_no_bitcode(archive):
+    """Fail if any object still has a bitcode section. An ELF object names its
+    sections in a string table and a COFF one in its section headers; either
+    way the name appears in the object's bytes only while the section is
+    there."""
+    with tempfile.TemporaryDirectory(dir=archive.parent) as tmp:
+        left = [
+            f"{m.name}: {s}"
+            for m in extract(archive, Path(tmp))
+            for s in BITCODE_SECTIONS
+            if s.encode() + b"\x00" in m.read_bytes()
+        ]
+    if left:
+        raise SystemExit(f"{archive} still has embedded bitcode, which Go refuses to link:\n  " + "\n  ".join(left[:20]))
 
 
 def chunks(members, size=100):
