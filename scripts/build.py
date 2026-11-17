@@ -155,7 +155,10 @@ def extract(archive, into):
             else:
                 if name.startswith("/"):  # an offset into the long name table
                     start = int(name[1:])
-                    name = names[start:names.index(b"/\n", start)].decode()
+                    # GNU ends each name with "/\n", the COFF format llvm-ar
+                    # writes on Windows with a NUL.
+                    ends = [i for i in (names.find(b"/\n", start), names.find(b"\x00", start)) if i >= 0]
+                    name = names[start:min(ends)].decode()
                 directory = into / str(len(members))
                 directory.mkdir()
                 path = directory / name.removesuffix("/")
